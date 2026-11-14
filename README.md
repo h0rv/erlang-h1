@@ -687,7 +687,30 @@ component may be `infinity`, or `0` to disable the drain. The legacy
 
 ### Timeouts and slowloris
 
-`idle_timeout` re-arms on every byte over the connection; it only fires when the peer stops talking entirely. `request_timeout` is armed while a request is in flight (from send-request on the client / from header receipt on the server) and cleared when the response completes. Either firing stops the connection with `{shutdown, idle_timeout}` / `{shutdown, request_timeout}`.
+On the server, `idle_timeout` limits silence while receiving a partial request
+line, headers or body, and while waiting for a new keep-alive request. It
+re-arms on incoming data. At a complete request boundary, it is suspended
+while any response remains outstanding, including while waiting for response
+headers. Completing the last response starts a fresh full keep-alive interval.
+Partial input for a pipelined next request is still subject to idle timeout,
+even when earlier responses are outstanding. Upgrade handshakes retain their
+existing timeout bounds.
+
+Server `request_timeout` protects request reception and final response header
+generation. It re-arms on incoming data while input is incomplete or any
+request awaits final response headers. Sending response bytes does not extend
+that deadline. Informational 1xx headers do not end the wait. The timer is
+cleared only when input is complete and all outstanding requests have final
+response headers. A quiet streaming response body, e.g. SSE, can then remain
+open indefinitely. These timers are silence limits, not absolute deadlines
+against a peer that keeps sending data.
+
+Client semantics are unchanged. Client `idle_timeout` limits peer silence,
+including while waiting for a response or reading its body. Client
+`request_timeout` starts when sending a request and re-arms on incoming data
+while responses remain pending. It clears when all responses complete.
+Either timer firing stops the connection with `{shutdown, idle_timeout}` or
+`{shutdown, request_timeout}`.
 
 Pass `infinity` to disable.
 
