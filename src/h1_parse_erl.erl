@@ -141,6 +141,10 @@ apply_options([_ | R], St) ->
 get(P, Props) when is_list(Props) -> [get_prop(X, P) || X <- Props];
 get(P, Prop) -> get_prop(Prop, P).
 
+%% No bytes of the next message have been received, including tolerated
+%% leading empty lines (RFC 9112 §2.2).
+get_prop(message_boundary, #h1_parser{state = S, buffer = B, empty_lines = E}) ->
+    S =:= on_first_line andalso B =:= <<>> andalso E =:= 0;
 get_prop(buffer, #h1_parser{buffer = B}) -> B;
 get_prop(state, #h1_parser{state = S}) -> S;
 get_prop(version, #h1_parser{version = V}) -> V;

@@ -15,6 +15,13 @@
          init_per_testcase/2, end_per_testcase/2]).
 
 -export([
+    server_timeout_phases/1,
+    server_partial_input_timeouts/1,
+    server_header_timeout/1,
+    server_pipelined_header_timeout/1,
+    server_early_headers_timeout/1,
+    server_upgrade_timeout/1,
+    client_stream_idle_timeout/1,
     simple_get/1,
     request_carries_query_string/1,
     post_content_length/1,
@@ -55,7 +62,10 @@ groups() ->
      {upgrade, [],
       [upgrade_server_side, upgrade_client_side, upgrade_capsule_exchange]},
      {hardening, [],
-      [idle_timeout_closes_silent_connection,
+      [server_timeout_phases, server_partial_input_timeouts,
+       server_header_timeout, server_pipelined_header_timeout,
+       server_early_headers_timeout, server_upgrade_timeout,
+       client_stream_idle_timeout, idle_timeout_closes_silent_connection,
        pipeline_disabled_returns_error,
        client_auto_adds_host_header,
        server_rejects_1_1_request_without_host_with_400,
@@ -385,6 +395,151 @@ idle_timeout_closes_silent_connection(Config) ->
     %% terminate/3 emits a `{closed, Reason}' event with the stop reason.
     ok = wait_for_closed(Client, idle_timeout, 2000),
     try h1_connection:close(Client) catch _:_ -> ok end.
+
+%% Four phases: reception has both timers; waiting for final headers has
+%% request only; streaming has neither; truly idle has idle only. All peers
+%% below are real TCP sockets. Short recv timeouts also assert no stray bytes.
+server_timeout_phases(_Config) ->
+    lists:foreach(fun(Completion) ->
+        {Sock, Server} = timeout_server(180, 600),
+        Id = raw_request(Sock, Server),
+        ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 270)),
+        ok = h1_connection:send_response(Server, Id, 200,
+            [{<<"content-type">>, <<"text/event-stream">>}]),
+        {ok, _} = gen_tcp:recv(Sock, 0, 1000),
+        ok = h1_connection:send_data(Server, Id, <<"data: 0\n\n">>, false),
+        {ok, _} = gen_tcp:recv(Sock, 0, 1000),
+        %% Beyond both idle and the old request deadline: streaming is quiet.
+        ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 700)),
+        case Completion of
+            data -> ok = h1_connection:send_data(Server, Id, <<"next">>, true);
+            trailers -> ok = h1_connection:send_trailers(Server, Id,
+                                     [{<<"x-end">>, <<"yes">>}])
+        end,
+        {ok, _} = gen_tcp:recv(Sock, 0, 1000),
+        ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 80)),
+        %% Completion removed the stream and grants a full keepalive interval.
+        Id2 = raw_request(Sock, Server),
+        ok = h1_connection:respond(Server, Id2, 200, [], <<"ok">>),
+        {ok, _} = gen_tcp:recv(Sock, 0, 1000),
+        ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 80)),
+        ok = wait_for_closed(Server, idle_timeout, 1000),
+        ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
+        gen_tcp:close(Sock)
+    end, [data, trailers]).
+
+server_partial_input_timeouts(_Config) ->
+    %% Enumerate boundary x outstanding-response booleans. The complete /
+    %% outstanding and complete / empty cases are in server_timeout_phases.
+    lists:foreach(fun({Outstanding, Input, Idle, Request, Tag}) ->
+        {Sock, Server} = timeout_server(Idle, Request),
+        Prior = case Outstanding of
+            false -> undefined;
+            _ -> raw_request(Sock, Server)
+        end,
+        ok = gen_tcp:send(Sock, Input),
+        Wait = case Outstanding of
+            complete ->
+                ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 80)),
+                %% Completing an earlier response must neither cancel nor
+                %% refresh protection of partial pipelined input.
+                ok = h1_connection:respond(Server, Prior, 200, [], <<"ok">>),
+                {ok, _} = gen_tcp:recv(Sock, 0, 1000),
+                150;
+            _ -> 1000
+        end,
+        ok = wait_for_closed(Server, Tag, Wait),
+        ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
+        gen_tcp:close(Sock)
+    end, [{Pending, Input, Idle, Request, Tag}
+          || Pending <- [false, true, complete],
+             {Idle, Request, Tag} <- [{180, 600, idle_timeout},
+                                      {1000, 180, request_timeout}],
+             Input <- [<<"GE">>, <<"\r\n">>,
+                <<"GET / HTTP/1.1\r\nHost: x\r\nX: par">>,
+                <<"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\na">>]]).
+
+server_header_timeout(_Config) ->
+    lists:foreach(fun(Interim) ->
+        {Sock, Server} = timeout_server(100, 300),
+        Id = raw_request(Sock, Server),
+        case Interim of
+            true ->
+                ok = h1_connection:send_informational(Server, Id, 103, []),
+                {ok, _} = gen_tcp:recv(Sock, 0, 1000);
+            false -> ok
+        end,
+        ok = wait_for_closed(Server, request_timeout, 1000),
+        ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
+        gen_tcp:close(Sock)
+    end, [false, true]).
+
+server_pipelined_header_timeout(_Config) ->
+    {Sock, Server} = timeout_server(100, 300),
+    Id = raw_request(Sock, Server),
+    _ = raw_request(Sock, Server),
+    ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 150)),
+    ok = h1_connection:send_response(Server, Id, 200, []),
+    {ok, _} = gen_tcp:recv(Sock, 0, 1000),
+    ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 80)),
+    ok = h1_connection:send_data(Server, Id, <<"one">>, false),
+    {ok, _} = gen_tcp:recv(Sock, 0, 1000),
+    %% Neither final headers nor body bytes refresh the second header wait.
+    ok = wait_for_closed(Server, request_timeout, 150),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
+    gen_tcp:close(Sock).
+
+server_early_headers_timeout(_Config) ->
+    {Sock, Server} = timeout_server(1000, 180),
+    ok = gen_tcp:send(Sock,
+        <<"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\na">>),
+    {request, Id, _, _, _} = receive_h1(Server, 1000),
+    ok = h1_connection:send_response(Server, Id, 200, []),
+    {ok, _} = gen_tcp:recv(Sock, 0, 1000),
+    %% Final response headers must not cancel protection of an unfinished body.
+    ok = wait_for_closed(Server, request_timeout, 1000),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
+    gen_tcp:close(Sock).
+
+server_upgrade_timeout(_Config) ->
+    {Sock, Server} = timeout_server(100, 600),
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nHost: x\r\n",
+        "Connection: Upgrade\r\nUpgrade: test\r\n\r\n">>),
+    {upgrade, _, _, _, _, _} = receive_h1(Server, 1000),
+    ok = wait_for_closed(Server, idle_timeout, 1000),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 1000)),
+    gen_tcp:close(Sock).
+
+client_stream_idle_timeout(Config) ->
+    Sock = ?config(client_sock, Config),
+    Peer = ?config(server_sock, Config),
+    {ok, Client} = h1_connection:start_link(client, Sock, self(),
+        #{idle_timeout => 100, request_timeout => 600}),
+    ok = gen_tcp:controlling_process(Sock, Client),
+    ok = h1_connection:activate(Client),
+    connected = receive_h1(Client, 1000),
+    {ok, Id} = h1_connection:send_request(Client, <<"GET">>, <<"/">>, [], #{}),
+    {ok, _} = gen_tcp:recv(Peer, 0, 1000),
+    ok = gen_tcp:send(Peer, <<"HTTP/1.1 200 OK\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n3\r\none\r\n">>),
+    {response, Id, 200, _} = receive_h1(Client, 1000),
+    {data, Id, <<"one">>, false} = receive_h1(Client, 1000),
+    ok = wait_for_closed(Client, idle_timeout, 1000).
+
+timeout_server(Idle, Request) ->
+    {ok, {Sock, Peer}} = socket_pair(),
+    {ok, Server} = h1_connection:start_link(server, Peer, self(),
+        #{idle_timeout => Idle, request_timeout => Request}),
+    ok = gen_tcp:controlling_process(Peer, Server),
+    ok = h1_connection:activate(Server),
+    connected = receive_h1(Server, 1000),
+    {Sock, Server}.
+
+raw_request(Sock, Server) ->
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nHost: x\r\n\r\n">>),
+    {request, Id, _, _, _} = receive_h1(Server, 1000),
+    {data, Id, <<>>, true} = receive_h1(Server, 1000),
+    Id.
 
 wait_for_closed(Conn, Tag, Timeout) ->
     receive

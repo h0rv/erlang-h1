@@ -904,11 +904,29 @@ notify(Owner, Event, Conn) ->
 
 %% Generic gen_statem timeouts. Re-emitting `{{timeout, Name}, Time, _}'
 %% cancels and re-arms; `infinity' cancels without re-arming.
-idle_timeout_actions(#state{idle_timeout = infinity}) ->
+%% RFC 9112 §9.5 leaves inactivity timeout policy to implementations.
+%% Server invariant: suppress idle only at an inbound message boundary with
+%% outstanding responses. A partial pipelined start line is NOT a boundary.
+%% Upgrade/discard paths retain their existing bounds.
+idle_timeout_actions(#state{mode = server, upgrade_pending = false,
+                            reading = parse, streams = Streams} = State)
+  when map_size(Streams) > 0 ->
+    case inbound_boundary(State) of
+        true -> [{{timeout, idle}, infinity, idle}];
+        false -> idle_timeout_value(State)
+    end;
+idle_timeout_actions(State) ->
+    idle_timeout_value(State).
+
+inbound_boundary(#state{current_stream = undefined, parser = P}) ->
+    h1_parse_erl:get(P, message_boundary);
+inbound_boundary(_) -> false.
+
+idle_timeout_value(#state{idle_timeout = infinity}) ->
     [{{timeout, idle}, infinity, idle}];
-idle_timeout_actions(#state{idle_timeout = Ms}) when is_integer(Ms), Ms > 0 ->
+idle_timeout_value(#state{idle_timeout = Ms}) when is_integer(Ms), Ms > 0 ->
     [{{timeout, idle}, Ms, idle}];
-idle_timeout_actions(_) ->
+idle_timeout_value(_) ->
     [{{timeout, idle}, infinity, idle}].
 
 request_timeout_actions(#state{request_timeout = infinity}) ->
@@ -999,10 +1017,29 @@ request_timer_actions(#state{mode = client, pending = Q} = State) ->
         true  -> clear_request_timeout();
         false -> request_timeout_actions(State)
     end;
-request_timer_actions(#state{mode = server, current_stream = undefined}) ->
-    clear_request_timeout();
 request_timer_actions(#state{mode = server} = State) ->
-    request_timeout_actions(State).
+    case server_request_pending(State) of
+        true -> request_timeout_actions(State);
+        false -> clear_request_timeout()
+    end.
+
+%% Reception and final-header generation are bounded, but a quiet streaming
+%% response body is not. Interim 1xx never sets status; Upgrade stays bounded.
+server_request_pending(#state{upgrade_pending = true}) -> true;
+server_request_pending(#state{streams = Streams} = State) ->
+    not inbound_boundary(State) orelse
+        maps:fold(fun(_, #stream{status = Status}, Pending) ->
+                      Pending orelse Status =:= undefined
+                  end, false, Streams).
+
+%% Sending a response must not refresh another request's reception/header
+%% deadline. Only cancel once every protected phase is finished.
+response_request_timer_actions(#state{mode = server} = State) ->
+    case server_request_pending(State) of
+        true -> [];
+        false -> clear_request_timeout()
+    end;
+response_request_timer_actions(_) -> [].
 
 drive_parser({more, P}, State, _Mode) ->
     {ok, State#state{parser = P}};
@@ -1566,7 +1603,8 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
                 ok ->
                     State1 = handler_close(Close, StreamId,
                                            put_stream(Stream1, State0b)),
-                    {keep_state, State1, [{reply, From, ok} | ResumeActions]};
+                    {keep_state, State1, [{reply, From, ok} | ResumeActions]
+                     ++ response_request_timer_actions(State1)};
                 {error, R} ->
                     {keep_state_and_data, [{reply, From, {error, R}}]}
             end;
@@ -1644,7 +1682,8 @@ finish_server_send(From, StreamId, ResumeActions, State) ->
                        State#state.drain_budget, State).
 
 finish_server_send(From, StreamId, ResumeActions, Budget, State) ->
-    Actions = [{reply, From, ok} | ResumeActions],
+    Actions = [{reply, From, ok} | ResumeActions]
+              ++ response_request_timer_actions(State),
     case maps:find(StreamId, State#state.streams) of
         {ok, #stream{state = closed}} when State#state.mode =:= server ->
             enter_lingering_close(Actions, Budget, State);
@@ -1657,7 +1696,14 @@ finish_server_send(From, StreamId, ResumeActions, Budget, State) ->
                 true ->
                     {stop_and_reply, {shutdown, goaway_sent}, Actions, State};
                 false ->
-                    {keep_state, State, Actions}
+                    %% Only the last completed response starts a fresh full
+                    %% keep-alive interval; partial input keeps its deadline.
+                    Idle = case map_size(State#state.streams) =:= 0
+                                andalso inbound_boundary(State) of
+                        true -> idle_timeout_actions(State);
+                        false -> []
+                    end,
+                    {keep_state, State, Actions ++ Idle}
             end;
         _ ->
             {keep_state, State, Actions}
