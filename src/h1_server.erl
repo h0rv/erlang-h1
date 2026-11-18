@@ -58,6 +58,25 @@ handle_accepted(Socket, gen_tcp, Handler, ConnOpts, ServerOpts) ->
     run_connection(Socket, gen_tcp, Handler, ConnOpts, ServerOpts).
 
 run_connection(Socket, Transport, Handler, ConnOpts, ServerOpts) ->
+    case ack_deadline(Socket, Transport) of
+        ok -> start_connection(Socket, Transport, Handler, ConnOpts, ServerOpts);
+        {error, _Reason} -> close(Transport, Socket)
+    end.
+
+ack_deadline(Socket, Transport) ->
+    case os:type() of
+        {unix, linux} ->
+            %% RFC 9112 section 9.5: bound unacknowledged output, not
+            %% the lifetime of an otherwise healthy streaming response.
+            Opts = [{raw, 6, 18, <<20000:32/native-unsigned-integer>>}],
+            case Transport of
+                gen_tcp -> inet:setopts(Socket, Opts);
+                ssl -> ssl:setopts(Socket, Opts)
+            end;
+        _ -> ok
+    end.
+
+start_connection(Socket, Transport, Handler, ConnOpts, ServerOpts) ->
     case h1_connection:start_link(server, Socket, self(), ConnOpts) of
         {ok, Conn} ->
             case transfer(Transport, Socket, Conn) of
