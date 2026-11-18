@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- On Linux, accepted TCP and TLS connections close after 20 seconds of
+  unacknowledged output, so a network cut cannot retain a streaming response
+  until the system's longer TCP retry limit. Healthy streams remain open.
+- Unix-domain sockets handed to the server continue to serve requests;
+  the TCP acknowledgment deadline does not apply to them.
+
 ## [0.11.0] - 2026-11-13
 
 ### Added
