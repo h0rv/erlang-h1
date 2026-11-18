@@ -18,12 +18,14 @@
     tcp_limits_are_honoured/1,
     tcp_missing_handler/1,
     tcp_owner_death_closes_socket/1,
+    unix_socket_serves_request/1,
     tls_alpn_http_1_1/1
 ]).
 
 all() ->
     Base = [tcp_serves_request, tcp_keep_alive, tcp_limits_are_honoured,
-            tcp_missing_handler, tcp_owner_death_closes_socket],
+            tcp_missing_handler, tcp_owner_death_closes_socket,
+            unix_socket_serves_request],
     case os:find_executable("openssl") of
         false -> Base;
         _ -> Base ++ [tls_alpn_http_1_1]
@@ -61,6 +63,29 @@ tcp_serves_request(_Config) ->
         gen_tcp:close(Sock)
     after
         gen_tcp:close(Listen)
+    end.
+
+unix_socket_serves_request(_Config) ->
+    case os:type() of
+        {unix, linux} ->
+            Suffix = integer_to_binary(erlang:unique_integer([positive])),
+            Path = <<0, "h1-serve-", Suffix/binary>>,
+            Opts = [{inet_backend, socket}, binary, {active, false}],
+            {ok, Listen} = gen_tcp:listen(0, Opts ++ [local, {ifaddr, {local, Path}}]),
+            try
+                {ok, Peer} = gen_tcp:connect({local, Path}, 0, Opts, 5000),
+                try
+                    {ok, Accepted} = gen_tcp:accept(Listen, 5000),
+                    {ok, _Pid} = h1:serve_socket(Accepted, #{handler => fun echo_handler/5}),
+                    ok = gen_tcp:send(Peer, <<"GET /unix HTTP/1.1\r\nhost: x\r\n\r\n">>),
+                    ?assertMatch({200, _, <<"/unix">>}, recv_response(Peer))
+                after
+                    gen_tcp:close(Peer)
+                end
+            after
+                gen_tcp:close(Listen)
+            end;
+        _ -> {skip, "Linux abstract Unix-domain socket regression"}
     end.
 
 %% Keep-alive works: a second request on the same handed-off socket is

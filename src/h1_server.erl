@@ -66,14 +66,25 @@ run_connection(Socket, Transport, Handler, ConnOpts, ServerOpts) ->
 ack_deadline(Socket, Transport) ->
     case os:type() of
         {unix, linux} ->
-            %% RFC 9112 section 9.5: bound unacknowledged output, not
-            %% the lifetime of an otherwise healthy streaming response.
-            Opts = [{raw, 6, 18, <<20000:32/native-unsigned-integer>>}],
-            case Transport of
-                gen_tcp -> inet:setopts(Socket, Opts);
-                ssl -> ssl:setopts(Socket, Opts)
+            Name = case Transport of
+                gen_tcp -> inet:sockname(Socket);
+                ssl -> ssl:sockname(Socket)
+            end,
+            case Name of
+                {ok, {local, _}} -> ok;
+                {ok, {_, _}} -> tcp_ack_deadline(Socket, Transport);
+                {error, _} = Error -> Error
             end;
         _ -> ok
+    end.
+
+tcp_ack_deadline(Socket, Transport) ->
+    %% RFC 9112 section 9.5: bound unacknowledged output, not
+    %% the lifetime of an otherwise healthy streaming response.
+    Opts = [{raw, 6, 18, <<20000:32/native-unsigned-integer>>}],
+    case Transport of
+        gen_tcp -> inet:setopts(Socket, Opts);
+        ssl -> ssl:setopts(Socket, Opts)
     end.
 
 start_connection(Socket, Transport, Handler, ConnOpts, ServerOpts) ->
